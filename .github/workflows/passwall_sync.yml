@@ -1,0 +1,117 @@
+name: Sync upstream and build PassWall
+
+# This workflow automatically synchronizes changes from an upstream repository
+# into the current fork, updates the version information in
+# `luci-app-passwall/Makefile` based on the current date, and rebuilds the
+# package using the OpenWrt SDK.  The current date is taken in the
+# Asia/Taipei timezone, and the PKG_RELEASE is incremented if the package has
+# already been updated on the same day.
+#
+# Variables to adjust:
+#   - `BRANCH_NAME` is the branch in this repository that tracks upstream.
+#   - `UPSTREAM_REPO` is the GitHub repository to pull updates from (e.g. the
+#     original `xiaorouji/openwrt-passwall` project).
+#   - `UPSTREAM_BRANCH` is the branch in the upstream repository to merge (e.g. `main`).
+#   - `ARCH` selects the OpenWrt SDK architecture used for the build.
+#   - `PACKAGES` lists the packages to build; here we build only `luci-app-passwall`.
+
+on:
+  # Run automatically once per day at 02:00 UTC (10:00 Asia/Taipei).
+  schedule:
+    - cron: '0 2 * * *'
+  # Allow manual triggering from the Actions tab.
+  workflow_dispatch:
+
+env:
+  # Repository and branch names can be overridden at workflow dispatch time.
+  BRANCH_NAME: luci-smartdns-dev
+  UPSTREAM_REPO: xiaorouji/openwrt-passwall
+  UPSTREAM_BRANCH: main
+  ARCH: x86_64
+  PACKAGES: luci-app-passwall
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ env.BRANCH_NAME }}
+
+      - name: Configure Git user
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Add and fetch upstream
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }} || true
+          git fetch upstream
+
+      - name: Detect new commits from upstream
+        id: check
+        run: |
+          set -e
+          # Count how many commits upstream is ahead of our branch
+          COMMITS=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }} || echo 0)
+          echo "Upstream commits ahead: $COMMITS"
+          if [ "$COMMITS" -gt 0 ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          set -e
+          git merge --no-edit upstream/${{ env.UPSTREAM_BRANCH }}
+
+      - name: Update PKG_VERSION and PKG_RELEASE
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          set -e
+          MAKEFILE="luci-app-passwall/Makefile"
+          # Compute date string like 25.8.12 from Asia/Taipei timezone
+          CURRENT_DATE=$(TZ="Asia/Taipei" date +'%y.%m.%d' | sed -e 's/\.0\([0-9]\)/.\1/g')
+          # Read existing version and release
+          PKG_VERSION=$(grep -E '^PKG_VERSION:?=' "$MAKEFILE" | head -n 1 | cut -d '=' -f 2)
+          PKG_RELEASE=$(grep -E '^PKG_RELEASE:?=' "$MAKEFILE" | head -n 1 | cut -d '=' -f 2)
+          echo "Current computed date: $CURRENT_DATE"
+          echo "Existing PKG_VERSION: $PKG_VERSION"
+          echo "Existing PKG_RELEASE: $PKG_RELEASE"
+          if [ "$PKG_VERSION" != "$CURRENT_DATE" ]; then
+            # New day: update version and reset release
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$CURRENT_DATE/" "$MAKEFILE"
+            sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" "$MAKEFILE"
+            echo "Updated PKG_VERSION to $CURRENT_DATE and reset PKG_RELEASE to 1"
+          else
+            # Same day: increment release number
+            NEW_RELEASE=$((PKG_RELEASE + 1))
+            sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=$NEW_RELEASE/" "$MAKEFILE"
+            echo "Incremented PKG_RELEASE to $NEW_RELEASE"
+          fi
+          git add "$MAKEFILE"
+          git commit -m "luci-app-passwall: sync upstream and update version to $CURRENT_DATE" || echo "Nothing to commit"
+
+      - name: Push changes
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          git push origin HEAD:${{ env.BRANCH_NAME }}
+
+      - name: Build updated package
+        if: steps.check.outputs.update_needed == 'true'
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ env.ARCH }}
+          PACKAGES: ${{ env.PACKAGES }}
+
+      - name: Upload built packages
+        if: steps.check.outputs.update_needed == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.ARCH }}-packages
+          path: bin/packages/${{ env.ARCH }}/packages/*.ipk
