@@ -2,39 +2,40 @@ name: "Sync upstream & Build luci-app-passwall (auto bump release)"
 
 on:
   schedule:
-    - cron: "0 */6 * * *"     # 每 6 小时检查一次上游
-  workflow_dispatch: {}        # 也支持手动触发
+    - cron: "0 */3 * * *"     # 每6小时检查一次
+  workflow_dispatch: {}        # 手动触发
 
 env:
   TZ: Asia/Shanghai
-  TARGET_BRANCH: main          # 需要同步的分支（按需修改）
+  TARGET_BRANCH: main          # 需要同步/构建的分支
 
 permissions:
-  contents: write              # 调用 merge-upstream + 推送需要这个权限
+  contents: write              # merge-upstream 和发布 Release 需要
 
 jobs:
   sync_upstream:
-    name: Sync fork with upstream
+    name: "Sync fork with upstream"
     runs-on: ubuntu-latest
     outputs:
       updated: ${{ steps.sync.outputs.updated }}
       message: ${{ steps.sync.outputs.msg }}
     steps:
-      - name: Install jq
+      - name: "Install jq"
         run: |
           sudo apt-get -qq update
           sudo apt-get -qq install -y jq
 
-      - name: Checkout (full)
+      - name: "Checkout (full)"
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_BRANCH }}
           fetch-depth: 0
 
-      - name: Sync via GitHub API (merge-upstream)
+      - name: "Sync via GitHub API (merge-upstream)"
         id: sync
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           echo "Syncing branch: ${TARGET_BRANCH}"
           http_code=$(curl -sS -L -o resp.json -w "%{http_code}" \
             -X POST \
@@ -53,33 +54,16 @@ jobs:
 
           # 200 且 fast-forward 代表确实同步到了新提交
           if [ "$http_code" = "200" ] && echo "$merge_type" | grep -qi "fast-forward"; then
-            echo "updated=true" >> $GITHUB_OUTPUT
+            echo "updated=true" >> "$GITHUB_OUTPUT"
           else
-            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "updated=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "msg=$msg" >> $GITHUB_OUTPUT
-
-      # —— 如果你的仓库不是 fork，或接口不可用，可改用下方“git 方案”（取消注释并填写上游地址）——
-      # - name: Fallback: sync via git (non-fork or conflict case)
-      #   if: steps.sync.outputs.updated == ''
-      #   run: |
-      #     set -e
-      #     git config user.name  "github-actions[bot]"
-      #     git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      #     git remote add upstream https://github.com/<UPSTREAM_OWNER>/<UPSTREAM_REPO>.git
-      #     git fetch upstream ${{ env.TARGET_BRANCH }}
-      #     if [ "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)" ]; then
-      #       echo "updated=false" >> $GITHUB_OUTPUT
-      #       exit 0
-      #     fi
-      #     git merge --ff-only FETCH_HEAD
-      #     git push origin ${{ env.TARGET_BRANCH }}
-      #     echo "updated=true" >> $GITHUB_OUTPUT
+          echo "msg=$msg" >> "$GITHUB_OUTPUT"
 
   build_luci:
-    name: Build luci-app-passwall [Luci ${{ matrix.luci_ver }}]
+    name: "Build luci-app-passwall [Luci ${{ matrix.luci_ver }}]"
     needs: sync_upstream
-    if: needs.sync_upstream.outputs.updated == 'true'   # 仅在有上游更新时才构建
+    if: needs.sync_upstream.outputs.updated == 'true'   # 有上游更新才构建
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -87,16 +71,34 @@ jobs:
         include:
           - sdk_ver: "21.02"
             luci_ver: "19.07"
-            sdk_url: https://downloads.openwrt.org/releases/21.02.7/targets/x86/64/openwrt-sdk-21.02.7-x86-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz
+            sdk_url: "https://downloads.openwrt.org/releases/21.02.7/targets/x86/64/openwrt-sdk-21.02.7-x86-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz"
           - sdk_ver: "24.10"
             luci_ver: "24.10"
-            sdk_url: https://downloads.openwrt.org/releases/24.10.1/targets/x86/64/openwrt-sdk-24.10.1-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            sdk_url: "https://downloads.openwrt.org/releases/24.10.1/targets/x86/64/openwrt-sdk-24.10.1-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
 
     steps:
-      - name: Show sync message
-        run: echo "Upstream sync result: ${{ needs.sync_upstream.outputs.message }}"
+      - name: "Checkout repo (for reading upstream version)"
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
 
-      - name: Install build dependencies
+      - name: "Read Passwall version from repo (for tag)"
+        id: ver
+        shell: bash
+        run: |
+          ver=$(awk -F ':=' '/^PKG_VERSION/{gsub(/\r/,"");print $2}' luci-app-passwall/Makefile | tr -d '[:space:]')
+          rel=$(awk -F ':=' '/^PKG_RELEASE/{gsub(/\r/,"");print $2}' luci-app-passwall/Makefile | tr -d '[:space:]')
+          echo "tag=${ver}-${rel}" >> "$GITHUB_OUTPUT"
+          echo "Release tag will be: ${ver}-${rel}"
+
+      - name: "Show sync message"
+        shell: bash
+        run: |
+          echo "Upstream sync result: ${{ needs.sync_upstream.outputs.message }}"
+
+      - name: "Install build dependencies"
+        shell: bash
         run: |
           sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
           sudo -E apt-get -qq update
@@ -111,21 +113,23 @@ jobs:
           sudo -E apt-get -qq autoremove --purge
           sudo -E apt-get -qq clean
 
-      - name: Download & unpack SDK
+      - name: "Download & unpack SDK"
+        shell: bash
         run: |
-          wget ${{ matrix.sdk_url }}
-          file_name=$(echo ${{ matrix.sdk_url }} | awk -F/ '{print $NF}')
+          wget "${{ matrix.sdk_url }}"
+          file_name=$(echo "${{ matrix.sdk_url }}" | awk -F/ '{print $NF}')
           mkdir sdk
           if [[ $file_name == *.tar.xz ]]; then
-            tar -xJf $file_name -C ./sdk --strip-components=1
+            tar -xJf "$file_name" -C ./sdk --strip-components=1
           elif [[ $file_name == *.tar.zst ]]; then
-            tar --zstd -x -f $file_name -C ./sdk --strip-components=1
+            tar --zstd -x -f "$file_name" -C ./sdk --strip-components=1
           else
             echo "Unsupported file format: $file_name"
             exit 1
           fi
 
-      - name: Configure feeds (Luci only)
+      - name: "Configure feeds (Luci only)"
+        shell: bash
         run: |
           cd sdk
           cat > feeds.conf.default << 'EOF'
@@ -139,27 +143,29 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Auto-bump PKG_RELEASE (build-only)
+      - name: "Auto-bump PKG_RELEASE (build-only)"
+        shell: bash
         run: |
           cd sdk
-          # 注意：在 SDK 中路径是 feeds/passwall/luci-app-passwall/Makefile
+          # 仅在构建目录里改，仓库不改；确保每次安装版本唯一且递增
           REL="$(date -u +%Y%m%d%H%M)${{ github.run_number }}"
           sed -i -E "s/^(PKG_RELEASE\s*:?=).*/\1 ${REL}/" feeds/passwall/luci-app-passwall/Makefile
           echo "New PKG_RELEASE=${REL}"
           grep -nE '^(PKG_NAME|PKG_VERSION|PKG_RELEASE)\s*:?=' feeds/passwall/luci-app-passwall/Makefile
 
-      - name: Compile luci-app-passwall
+      - name: "Compile luci-app-passwall"
+        shell: bash
         run: |
           cd sdk
-          {
-            echo "CONFIG_ALL_NONSHARED=n"
-            echo "CONFIG_ALL_KMODS=n"
-            echo "CONFIG_ALL=n"
-            echo "CONFIG_AUTOREMOVE=n"
-            echo "CONFIG_SIGNED_PACKAGES=n"
-            echo "CONFIG_LUCI_LANG_zh_Hans=y"
-            echo "CONFIG_PACKAGE_luci-app-passwall=m"
-          } > .config
+          cat > .config << 'CFG'
+          CONFIG_ALL_NONSHARED=n
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          CONFIG_AUTOREMOVE=n
+          CONFIG_SIGNED_PACKAGES=n
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci-app-passwall=m
+          CFG
 
           make defconfig
           make package/luci-app-passwall/{clean,compile} -j"$(nproc)" V=s
@@ -169,27 +175,32 @@ jobs:
           mkdir -p ../output
           mv "$feed_dir"/*.ipk ../output/
 
-          # 统一重命名（带 luci 版本与 run 编号，避免重名）
+          # 统一前缀，避免不同 run 的产物重名
           cd ../output && for f in *.ipk; do mv "$f" "luci-${{ matrix.luci_ver }}_${{ github.run_number }}_$f"; done
 
-      - name: Upload artifacts
+      - name: "Upload artifacts"
         uses: actions/upload-artifact@v4
         with:
           name: luci-ipks-${{ matrix.luci_ver }}
           path: output/*.ipk
           if-no-files-found: error
 
-      # —— 如需发布 Release（夜版），取消注释下面两步 —— 
-      # - name: Prepare release notes
-      #   run: |
-      #     echo "Synced upstream: ${{ needs.sync_upstream.outputs.message }}" > release.txt
-      #     date +"Build time (Asia/Shanghai): %Y-%m-%d %H:%M:%S" >> release.txt
-      # - name: Upload to Release
-      #   uses: softprops/action-gh-release@v2
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   with:
-      #     tag_name: nightly-luci
-      #     prerelease: true
-      #     body_path: release.txt
-      #     files: output/*.ipk
+      - name: "Prepare release notes"
+        shell: bash
+        run: |
+          {
+            echo "## :mega:Update content"
+            echo "### Passwall Info"
+            echo "**:minidisc: Passwall Version: ${{ steps.ver.outputs.tag }}**"
+          } > release.txt
+
+      - name: "Upload IPKs to Release (auto-create if missing)"
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}           # 例：25.8.31-1
+          target_commitish: ${{ env.TARGET_BRANCH }}
+          generate_release_notes: false
+          body_path: release.txt
+          files: output/*.ipk
