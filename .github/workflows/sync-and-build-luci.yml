@@ -1,20 +1,24 @@
-name: "Sync upstream & Build luci-app-passwall (auto bump release)"
+name: Sync upstream & Build luci-app-passwall (API/3h)
 
 on:
   schedule:
-    - cron: "0 */3 * * *"     # 每6小时检查一次
-  workflow_dispatch: {}        # 手动触发
+    - cron: "0 */3 * * *"      # 每3小时检查一次
+  workflow_dispatch: {}         # 支持手动触发
 
 env:
   TZ: Asia/Shanghai
-  TARGET_BRANCH: main          # 需要同步/构建的分支
+  TARGET_BRANCH: main            # 需要同步/构建的分支
 
 permissions:
-  contents: write              # merge-upstream 和发布 Release 需要
+  contents: write                # merge-upstream & 发布 Release 需要
+
+concurrency:
+  group: passwall-api-build
+  cancel-in-progress: true
 
 jobs:
   sync_upstream:
-    name: "Sync fork with upstream"
+    name: "Sync fork with upstream (API)"
     runs-on: ubuntu-latest
     outputs:
       updated: ${{ steps.sync.outputs.updated }}
@@ -52,9 +56,20 @@ jobs:
           echo "Message: $msg"
           echo "Merge-Type: $merge_type"
 
-          # 200 且 fast-forward 代表确实同步到了新提交
-          if [ "$http_code" = "200" ] && echo "$merge_type" | grep -qi "fast-forward"; then
-            echo "updated=true" >> "$GITHUB_OUTPUT"
+          # 200 表示调用成功；fast-forward 或 merge 都说明确有新提交
+          if [ "$http_code" = "200" ]; then
+            case "$merge_type" in
+              fast-forward|merge)
+                echo "updated=true" >> "$GITHUB_OUTPUT"
+                ;;
+              already-up-to-date|"")
+                echo "updated=false" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "updated=false" >> "$GITHUB_OUTPUT"
+                echo "Unknown merge_type: $merge_type"
+                ;;
+            esac
           else
             echo "updated=false" >> "$GITHUB_OUTPUT"
           fi
@@ -63,7 +78,7 @@ jobs:
   build_luci:
     name: "Build luci-app-passwall [Luci ${{ matrix.luci_ver }}]"
     needs: sync_upstream
-    if: needs.sync_upstream.outputs.updated == 'true'   # 有上游更新才构建
+    if: needs.sync_upstream.outputs.updated == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -189,9 +204,11 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## :mega:Update content"
+            echo "## :mega: Update content"
             echo "### Passwall Info"
             echo "**:minidisc: Passwall Version: ${{ steps.ver.outputs.tag }}**"
+            echo ""
+            echo "Auto-bumped PKG_RELEASE during build to ensure unique installable version."
           } > release.txt
 
       - name: "Upload IPKs to Release (auto-create if missing)"
@@ -199,7 +216,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}           # 例：25.8.31-1
+          tag_name: ${{ steps.ver.outputs.tag }}           # 例如：25.8.31-1
           target_commitish: ${{ env.TARGET_BRANCH }}
           generate_release_notes: false
           body_path: release.txt
