@@ -56,33 +56,43 @@ jobs:
           echo "Message: $msg"
           echo "Merge-Type: $merge_type"
 
-          # 200 表示调用成功；fast-forward 或 merge 说明确有新提交
           if [ "$http_code" = "200" ]; then
             case "$merge_type" in
-              fast-forward|merge)
-                echo "updated=true" >> "$GITHUB_OUTPUT"
-                ;;
-              none|already-up-to-date|"")
-                echo "updated=false" >> "$GITHUB_OUTPUT"
-                ;;
-              *)
-                echo "updated=false" >> "$GITHUB_OUTPUT"
-                echo "Unknown merge_type: $merge_type"
-                ;;
+              fast-forward|merge) echo "updated=true"  >> "$GITHUB_OUTPUT" ;;
+              none|already-up-to-date|"") echo "updated=false" >> "$GITHUB_OUTPUT" ;;
+              *) echo "updated=false" >> "$GITHUB_OUTPUT"; echo "Unknown merge_type: $merge_type" ;;
             esac
           else
             echo "updated=false" >> "$GITHUB_OUTPUT"
           fi
           echo "msg=$msg" >> "$GITHUB_OUTPUT"
 
-          # 可选：打印完整响应，便于排错（不会影响功能）
           echo "=== API raw response ==="
           jq . resp.json || true
           echo "========================"
 
+  # 读取一次版本号，供发布使用
+  get_version:
+    name: "Read Passwall version (once)"
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+      - id: ver
+        shell: bash
+        run: |
+          ver=$(awk -F ':=' '/^PKG_VERSION/{gsub(/\r/,"");print $2}' luci-app-passwall/Makefile | tr -d '[:space:]')
+          rel=$(awk -F ':=' '/^PKG_RELEASE/{gsub(/\r/,"");print $2}' luci-app-passwall/Makefile | tr -d '[:space:]')
+          echo "tag=${ver}-${rel}" >> "$GITHUB_OUTPUT"
+          echo "Release tag will be: ${ver}-${rel}"
+
   build_luci:
     name: "Build luci-app-passwall [Luci ${{ matrix.luci_ver }}]"
-    needs: sync_upstream
+    needs: [sync_upstream, get_version]
     if: needs.sync_upstream.outputs.updated == 'true'
     runs-on: ubuntu-latest
     strategy:
@@ -102,15 +112,6 @@ jobs:
         with:
           ref: ${{ env.TARGET_BRANCH }}
           fetch-depth: 0
-
-      - name: "Read Passwall version from repo (for tag)"
-        id: ver
-        shell: bash
-        run: |
-          ver=$(awk -F ':=' '/^PKG_VERSION/{gsub(/\r/,"");print $2}' luci-app-passwall/Makefile | tr -d '[:space:]')
-          rel=$(awk -F ':=' '/^PKG_RELEASE/{gsub(/\r/,"");print $2}' luci-app-passwall/Makefile | tr -d '[:space:]')
-          echo "tag=${ver}-${rel}" >> "$GITHUB_OUTPUT"
-          echo "Release tag will be: ${ver}-${rel}"
 
       - name: "Show sync message"
         shell: bash
@@ -205,24 +206,42 @@ jobs:
           path: output/*.ipk
           if-no-files-found: error
 
+  publish_release:
+    name: "Publish GitHub Release"
+    needs: [sync_upstream, get_version, build_luci]
+    if: needs.sync_upstream.outputs.updated == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Download all artifacts"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: luci-ipks-*
+          merge-multiple: true
+          path: dist
+
       - name: "Prepare release notes"
         shell: bash
         run: |
           {
             echo "## :mega: Update content"
             echo "### Passwall Info"
-            echo "**:minidisc: Passwall Version: ${{ steps.ver.outputs.tag }}**"
+            echo "**:minidisc: Passwall Version: ${{ needs.get_version.outputs.tag }}**"
             echo ""
             echo "Auto-bumped PKG_RELEASE during build to ensure unique installable version."
+            echo ""
+            echo "### Artifacts"
+            ls -1 dist | sed 's/^/- /'
           } > release.txt
+          echo "Release notes prepared:"
+          cat release.txt
 
-      - name: "Upload IPKs to Release (auto-create if missing)"
+      - name: "Create/Update GitHub Release"
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}           # 例如：25.8.31-1
+          tag_name: ${{ needs.get_version.outputs.tag }}     # 例如：25.8.31-1
           target_commitish: ${{ env.TARGET_BRANCH }}
           generate_release_notes: false
           body_path: release.txt
-          files: output/*.ipk
+          files: dist/*.ipk
