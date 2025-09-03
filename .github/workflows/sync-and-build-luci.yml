@@ -71,12 +71,13 @@ jobs:
           jq . resp.json || true
           echo "========================"
 
-  # 读取一次版本号，供发布使用
+  # 一次性读取仓库里的 PKG_VERSION/PKG_RELEASE，并生成唯一 tag
   get_version:
     name: "Read Passwall version (once)"
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.ver.outputs.tag }}
+      build_id: ${{ steps.ver.outputs.build_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -87,8 +88,10 @@ jobs:
         run: |
           ver=$(awk -F ':=' '/^PKG_VERSION/{gsub(/\r/,"");print $2}' luci-app-passwall/Makefile | tr -d '[:space:]')
           rel=$(awk -F ':=' '/^PKG_RELEASE/{gsub(/\r/,"");print $2}' luci-app-passwall/Makefile | tr -d '[:space:]')
-          echo "tag=${ver}-${rel}" >> "$GITHUB_OUTPUT"
-          echo "Release tag will be: ${ver}-${rel}"
+          BUILD_ID="$(date -u +%Y%m%d%H%M)${GITHUB_RUN_NUMBER}"
+          echo "tag=${ver}-${rel}-build.${BUILD_ID}" >> "$GITHUB_OUTPUT"
+          echo "build_id=${BUILD_ID}" >> "$GITHUB_OUTPUT"
+          echo "Release tag will be: ${ver}-${rel}-build.${BUILD_ID}"
 
   build_luci:
     name: "Build luci-app-passwall [Luci ${{ matrix.luci_ver }}]"
@@ -227,6 +230,7 @@ jobs:
             echo "### Passwall Info"
             echo "**:minidisc: Passwall Version: ${{ needs.get_version.outputs.tag }}**"
             echo ""
+            echo "Build ID: ${{ needs.get_version.outputs.build_id }}"
             echo "Auto-bumped PKG_RELEASE during build to ensure unique installable version."
             echo ""
             echo "### Artifacts"
@@ -240,7 +244,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ needs.get_version.outputs.tag }}     # 例如：25.8.31-1
+          tag_name: ${{ needs.get_version.outputs.tag }}     # e.g. 25.8.26-1-build.2025090312301234
           target_commitish: ${{ env.TARGET_BRANCH }}
           generate_release_notes: false
           body_path: release.txt
